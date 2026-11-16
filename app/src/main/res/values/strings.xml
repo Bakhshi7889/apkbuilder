@@ -1,0 +1,69 @@
+<resources>
+    <string name="app_name">APK Builder</string>
+
+    <string name="nav_apps">Apps</string>
+    <string name="nav_build">Build</string>
+    <string name="nav_sign">Sign</string>
+
+    <string name="apps_empty_title">No GitHub apps watched yet</string>
+    <string name="apps_empty_subtitle">Add multiple GitHub apps below. To save battery, APK Builder checks GitHub automatically only when you open the app and notifies you of new commits or APK releases.</string>
+    <string name="apps_check_all">Check All Updates Now</string>
+    <string name="apps_add_button">Add GitHub App</string>
+    <string name="apps_add_hint">owner/repo or https://github.com/owner/repo</string>
+    <string name="apps_add_submit">Start Watching</string>
+    <string name="cd_nav_apps">Switch to Watched Apps &amp; Updates screen</string>
+
+    <string name="self_update_title">This App Self-Update</string>
+    <string name="self_update_configure">Link This App\'s GitHub Repo</string>
+    <string name="self_update_run">Update Now (On-Device Gradle)</string>
+    <string name="self_update_ci_yaml">GitHub Actions Starter YAML</string>
+    <string name="termux_run_build">Run in Termux</string>
+
+    <string name="builder_empty_title">No Android project loaded</string>
+    <string name="builder_empty_subtitle">Import a repository from GitHub or pick a local .zip / folder to inspect Gradle configuration, check updates, and build APKs offline.</string>
+    <string name="builder_import_github">Import from GitHub</string>
+    <string name="builder_import_zip">Import Local (.zip)</string>
+    <string name="builder_more_sources">Local &amp; starter options</string>
+    <string name="builder_pick_folder">Pick Folder</string>
+    <string name="builder_create_starter">Create Starter Gradle Project</string>
+
+    <string name="github_repo_hint">Search GitHub or paste owner/repo URL</string>
+    <string name="github_search_action">Search GitHub</string>
+    <string name="github_open_browser">Open Browser</string>
+    <string name="github_filter_android">Android / Kotlin</string>
+    <string name="github_token_toggle">Private repo? Optional GitHub token</string>
+    <string name="github_token_hint">ghp_… or github_pat_… (optional for public repos)</string>
+    <string name="github_clone_action">Download Repo</string>
+    <string name="github_check_updates">Check Updates</string>
+    <string name="github_pull_latest">Pull Latest</string>
+    <string name="github_download_release_apk">Get Release APK</string>
+
+    <string name="builder_run_offline">Build APK (--offline)</string>
+    <string name="builder_run_online">Build APK (Online)</string>
+    <string name="builder_run_cloud">Check &amp; Trigger Cloud Build</string>
+    <string name="builder_mode_device">Device Gradle</string>
+    <string name="builder_mode_cloud">Cloud (GitHub Actions)</string>
+    <string name="builder_gradle_online_toggle">Online Gradle (fetch deps)</string>
+    <string name="builder_gradle_offline_toggle">Offline (--offline)</string>
+    <string name="builder_export_zip">Export (.zip)</string>
+    <string name="builder_copy_script">Copy Script</string>
+    <string name="builder_files_label">Project Files</string>
+    <string name="builder_build_output_label">Build Output</string>
+    <string name="builder_toolchain_toggle">Device Toolchain</string>
+    <string name="builder_save_file">Save File</string>
+    <string name="builder_discard_file">Close</string>
+    <string name="shell_open_termux">Open Termux</string>
+
+    <string name="sign_header_title">APK Signer</string>
+    <string name="sign_select_apk">Select APK</string>
+    <string name="sign_pick_apk">Pick .apk File</string>
+    <string name="sign_keystore_title">Signing Keystore</string>
+    <string name="sign_new_keystore">New Keystore (.p12)</string>
+    <string name="sign_import_keystore">Import Keystore</string>
+    <string name="sign_action_button">Sign APK (v1+v2+v3)</string>
+    <string name="sign_export_apk">Export Signed APK</string>
+
+    <string name="cd_nav_build">Switch to APK Build screen</string>
+    <string name="cd_nav_sign">Switch to APK Signer screen</string>
+    <string name="cd_import_github">Import Android project from GitHub</string>
+</resources>

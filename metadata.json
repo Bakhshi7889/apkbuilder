@@ -1,0 +1,6 @@
+{
+  "name": "APK Builder",
+  "description": "On-device Linux shell, Termux environment bridge, and offline Android Gradle project inspector and APK build runner.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
