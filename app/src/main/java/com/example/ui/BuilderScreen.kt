@@ -147,12 +147,18 @@ fun BuilderScreen(
   onSendApkToSigner: (String) -> Unit,
   onExportZip: (String) -> Unit,
   onCopyScript: () -> Unit,
+  onOpenBuiltInShell: () -> Unit,
+  onToggleExternalTermux: () -> Unit,
   onRunInTermux: () -> Unit,
+  onInstallTermux: () -> Unit,
+  onRequestTermuxPermission: () -> Unit,
+  onCopyTermuxSetup: () -> Unit,
   onCreateTermuxIntent: () -> android.content.Intent?,
   modifier: Modifier = Modifier,
 ) {
   val context = LocalContext.current
   val termuxInstalled = state.envInfo?.termuxInstalled == true
+  val hasTermuxPermission = state.envInfo?.hasTermuxPermission == true
 
   Column(
     modifier = modifier.fillMaxSize().padding(horizontal = 16.dp),
@@ -614,8 +620,15 @@ fun BuilderScreen(
               ToolchainCard(
                 env = env,
                 isExpanded = state.isToolchainExpanded,
+                isExternalTermuxExpanded = state.isExternalTermuxExpanded,
                 onToggle = onToggleToolchain,
+                onToggleExternalTermux = onToggleExternalTermux,
+                onOpenBuiltInShell = onOpenBuiltInShell,
                 onRefresh = onRefreshToolchain,
+                onRunInTermux = onRunInTermux,
+                onInstallTermux = onInstallTermux,
+                onRequestTermuxPermission = onRequestTermuxPermission,
+                onCopyTermuxSetup = onCopyTermuxSetup,
                 onOpenTermux = {
                   onCreateTermuxIntent()?.let { intent -> context.startActivity(intent) }
                 },
@@ -702,17 +715,24 @@ fun BuilderScreen(
               BuildOutputCard(
                 isBuilding = state.isBuilding,
                 isExpanded = state.isBuildPanelExpanded,
+                isExternalTermuxExpanded = state.isExternalTermuxExpanded,
                 logs = state.buildLogs,
                 outcome = state.buildOutcome,
                 scriptPreview = state.scriptPreview,
                 termuxInstalled = termuxInstalled,
+                hasTermuxPermission = hasTermuxPermission,
                 hasGitHubMeta = state.activeGitHubMeta != null,
                 onToggleExpanded = onToggleBuildPanel,
+                onToggleExternalTermux = onToggleExternalTermux,
+                onOpenBuiltInShell = onOpenBuiltInShell,
                 onSwitchToCloudBuild = { onSetBuildMode(BuildMode.CLOUD_GITHUB_ACTIONS) },
                 onCopyScript = onCopyScript,
                 onSendApkToSigner = onSendApkToSigner,
                 onExportZip = { onExportZip("${active.workspaceName}.zip") },
                 onRunInTermux = onRunInTermux,
+                onInstallTermux = onInstallTermux,
+                onRequestTermuxPermission = onRequestTermuxPermission,
+                onCopyTermuxSetup = onCopyTermuxSetup,
                 onOpenTermux = {
                   onCreateTermuxIntent()?.let { intent -> context.startActivity(intent) }
                 },
@@ -1711,8 +1731,15 @@ private fun CloudActionsCard(
 private fun ToolchainCard(
   env: SystemEnvironmentInfo,
   isExpanded: Boolean,
+  isExternalTermuxExpanded: Boolean,
   onToggle: () -> Unit,
+  onToggleExternalTermux: () -> Unit,
+  onOpenBuiltInShell: () -> Unit,
   onRefresh: () -> Unit,
+  onRunInTermux: () -> Unit,
+  onInstallTermux: () -> Unit,
+  onRequestTermuxPermission: () -> Unit,
+  onCopyTermuxSetup: () -> Unit,
   onOpenTermux: () -> Unit,
 ) {
   Surface(
@@ -1748,9 +1775,7 @@ private fun ToolchainCard(
               color = MaterialTheme.colorScheme.onSurface,
             )
             Text(
-              text =
-                "${env.kernelName} ${env.machineArch} • ${env.cpuCores} cores • " +
-                  if (env.termuxInstalled) "Termux detected" else "Termux not installed",
+              text = "${env.kernelName} ${env.machineArch} • ${env.cpuCores} cores • Built-In Shell + Cloud CI",
               style = MaterialTheme.typography.bodySmall,
               color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -1794,6 +1819,12 @@ private fun ToolchainCard(
               )
               Text(
                 text =
+                  "NATIVE_LIB_DIR (${env.bundledNativeBins.size} bundled) • /system/bin (${env.systemBinToolsCount})",
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = JetBrainsMono),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+              Text(
+                text =
                   "Gradle Tuning: --max-workers=${env.cpuCores} -Xmx${env.recommendedHeapMb}m --parallel --build-cache",
                 style = MaterialTheme.typography.bodySmall.copy(fontFamily = JetBrainsMono),
                 color = MaterialTheme.colorScheme.primary,
@@ -1827,15 +1858,86 @@ private fun ToolchainCard(
             verticalArrangement = Arrangement.spacedBy(8.dp),
           ) {
             CompactActionChip(
+              icon = Icons.Filled.Terminal,
+              label = "Open Built-In Shell",
+              onClick = onOpenBuiltInShell,
+            )
+            CompactActionChip(
               icon = Icons.Filled.Refresh,
               label = "Re-probe",
               onClick = onRefresh,
             )
-            if (env.termuxInstalled) {
+          }
+
+          Row(
+            modifier =
+              Modifier.fillMaxWidth()
+                .heightIn(min = 48.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .clickable(onClick = onToggleExternalTermux)
+                .padding(horizontal = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+          ) {
+            Text(
+              text = stringResource(R.string.self_external_termux_toggle),
+              style = MaterialTheme.typography.bodySmall,
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Icon(
+              imageVector =
+                if (isExternalTermuxExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+              contentDescription = null,
+              tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+          }
+
+          AnimatedVisibility(
+            visible = isExternalTermuxExpanded,
+            enter = fadeIn() + expandVertically(),
+            exit = fadeOut() + shrinkVertically(),
+          ) {
+            FlowRow(
+              horizontalArrangement = Arrangement.spacedBy(8.dp),
+              verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+              when {
+                !env.termuxInstalled -> {
+                  CompactActionChip(
+                    icon = Icons.Filled.CloudDownload,
+                    label = stringResource(R.string.termux_install_apk),
+                    onClick = onInstallTermux,
+                  )
+                }
+                !env.hasTermuxPermission -> {
+                  CompactActionChip(
+                    icon = Icons.Filled.VerifiedUser,
+                    label = stringResource(R.string.termux_grant_permission),
+                    onClick = onRequestTermuxPermission,
+                  )
+                  CompactActionChip(
+                    icon = Icons.Filled.Terminal,
+                    label = stringResource(R.string.shell_open_termux),
+                    onClick = onOpenTermux,
+                  )
+                }
+                else -> {
+                  CompactActionChip(
+                    icon = Icons.Filled.PlayArrow,
+                    label = stringResource(R.string.termux_run_build),
+                    onClick = onRunInTermux,
+                  )
+                  CompactActionChip(
+                    icon = Icons.Filled.Terminal,
+                    label = stringResource(R.string.shell_open_termux),
+                    onClick = onOpenTermux,
+                  )
+                }
+              }
               CompactActionChip(
-                icon = Icons.Filled.Terminal,
-                label = stringResource(R.string.shell_open_termux),
-                onClick = onOpenTermux,
+                icon = Icons.Filled.ContentCopy,
+                label = stringResource(R.string.termux_copy_setup),
+                onClick = onCopyTermuxSetup,
               )
             }
           }
@@ -1980,17 +2082,24 @@ private fun FileNodeMorphRow(
 private fun BuildOutputCard(
   isBuilding: Boolean,
   isExpanded: Boolean,
+  isExternalTermuxExpanded: Boolean,
   logs: List<String>,
   outcome: BuildStepEvent.Completed?,
   scriptPreview: String?,
   termuxInstalled: Boolean,
+  hasTermuxPermission: Boolean,
   hasGitHubMeta: Boolean,
   onToggleExpanded: () -> Unit,
+  onToggleExternalTermux: () -> Unit,
+  onOpenBuiltInShell: () -> Unit,
   onSwitchToCloudBuild: () -> Unit,
   onCopyScript: () -> Unit,
   onSendApkToSigner: (String) -> Unit,
   onExportZip: () -> Unit,
   onRunInTermux: () -> Unit,
+  onInstallTermux: () -> Unit,
+  onRequestTermuxPermission: () -> Unit,
+  onCopyTermuxSetup: () -> Unit,
   onOpenTermux: () -> Unit,
 ) {
   Surface(
@@ -2081,15 +2190,26 @@ private fun BuildOutputCard(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
               ) {
                 Text(
-                  text = "Android's app sandbox has no java/gradle binaries installed. Switch to Cloud (GitHub Actions) to compile an APK online, or export the script + .zip into Termux.",
+                  text =
+                    "Android's sandbox restricts executing downloaded OpenJDK/Gradle inside app data (W^X). Compile this project cleanly inside APK Builder via Cloud (GitHub Actions) without any separate Termux APK, or inspect tools in the Built-In Shell.",
                   style = MaterialTheme.typography.bodySmall,
                   color = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
-                if (hasGitHubMeta) {
+                FlowRow(
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                  verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                  if (hasGitHubMeta) {
+                    CompactActionChip(
+                      icon = Icons.Filled.CloudQueue,
+                      label = "Use Cloud (GitHub Actions)",
+                      onClick = onSwitchToCloudBuild,
+                    )
+                  }
                   CompactActionChip(
-                    icon = Icons.Filled.CloudQueue,
-                    label = "Use Cloud (GitHub Actions)",
-                    onClick = onSwitchToCloudBuild,
+                    icon = Icons.Filled.Terminal,
+                    label = "Open Built-In Shell",
+                    onClick = onOpenBuiltInShell,
                   )
                 }
               }
@@ -2151,25 +2271,81 @@ private fun BuildOutputCard(
                 label = stringResource(R.string.builder_export_zip),
                 onClick = onExportZip,
               )
-              if (termuxInstalled) {
-                CompactActionChip(
-                  icon = Icons.Filled.PlayArrow,
-                  label = stringResource(R.string.termux_run_build),
-                  onClick = onRunInTermux,
-                )
-                CompactActionChip(
-                  icon = Icons.Filled.Terminal,
-                  label = stringResource(R.string.shell_open_termux),
-                  onClick = onOpenTermux,
-                )
-              }
             }
-            if (termuxInstalled) {
+
+            Row(
+              modifier =
+                Modifier.fillMaxWidth()
+                  .heightIn(min = 48.dp)
+                  .clip(RoundedCornerShape(12.dp))
+                  .clickable(onClick = onToggleExternalTermux)
+                  .padding(horizontal = 6.dp)
+                  .testTag("builder_external_termux_toggle"),
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
               Text(
-                text = "Termux RUN_COMMAND auto-copies the command too; enable allow-external-apps=true in ~/.termux/termux.properties for direct 1-tap runs.",
+                text = stringResource(R.string.self_external_termux_toggle),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
               )
+              Icon(
+                imageVector =
+                  if (isExternalTermuxExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+
+            AnimatedVisibility(
+              visible = isExternalTermuxExpanded,
+              enter = fadeIn() + expandVertically(),
+              exit = fadeOut() + shrinkVertically(),
+            ) {
+              FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+              ) {
+                when {
+                  !termuxInstalled -> {
+                    CompactActionChip(
+                      icon = Icons.Filled.CloudDownload,
+                      label = stringResource(R.string.termux_install_apk),
+                      onClick = onInstallTermux,
+                      testTag = "builder_install_termux_button",
+                    )
+                  }
+                  !hasTermuxPermission -> {
+                    CompactActionChip(
+                      icon = Icons.Filled.VerifiedUser,
+                      label = stringResource(R.string.termux_grant_permission),
+                      onClick = onRequestTermuxPermission,
+                      testTag = "builder_grant_termux_perm_button",
+                    )
+                  }
+                  else -> {
+                    CompactActionChip(
+                      icon = Icons.Filled.PlayArrow,
+                      label = stringResource(R.string.termux_run_build),
+                      onClick = onRunInTermux,
+                      testTag = "builder_termux_run_button",
+                    )
+                  }
+                }
+                CompactActionChip(
+                  icon = Icons.Filled.ContentCopy,
+                  label = stringResource(R.string.termux_copy_setup),
+                  onClick = onCopyTermuxSetup,
+                  testTag = "builder_copy_termux_setup_button",
+                )
+                if (termuxInstalled) {
+                  CompactActionChip(
+                    icon = Icons.Filled.Terminal,
+                    label = stringResource(R.string.shell_open_termux),
+                    onClick = onOpenTermux,
+                  )
+                }
+              }
             }
           }
         }
@@ -2264,6 +2440,7 @@ internal fun CompactActionChip(
   icon: androidx.compose.ui.graphics.vector.ImageVector,
   label: String,
   onClick: () -> Unit,
+  testTag: String? = null,
 ) {
   Surface(
     shape = RoundedCornerShape(12.dp),
@@ -2271,7 +2448,8 @@ internal fun CompactActionChip(
     modifier =
       Modifier.heightIn(min = 48.dp)
         .clip(RoundedCornerShape(12.dp))
-        .clickable(onClick = onClick),
+        .clickable(onClick = onClick)
+        .then(if (testTag != null) Modifier.testTag(testTag) else Modifier),
   ) {
     Row(
       modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),

@@ -3,15 +3,18 @@ package com.example
 import android.content.Context
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.performTextInput
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.ApkSigningService
 import com.example.data.BuildOutcomeStatus
 import com.example.data.BuildStepEvent
 import com.example.data.GitHubRepository
+import com.example.data.ShellEvent
 import com.example.data.ImportPhase
 import com.example.data.ImportProgress
 import com.example.data.ProjectRepository
@@ -241,11 +244,39 @@ class TermForgeRobolectricTest {
     assertEquals("alice/termforge", saved.repoSlug)
     assertEquals("release", saved.branch)
 
-    val wsDir = File(context.filesDir, "workspaces/termforge").apply { mkdirs() }
-    val termuxIntent = selfRepo.buildTermuxRunCommandIntent(wsDir)
+    val engine = ShellEngine(context)
+    assertFalse(engine.hasTermuxRunPermission())
+    assertEquals(
+      ShellEngine.TERMUX_RELEASES_URL,
+      engine.createInstallTermuxIntent().dataString,
+    )
+
+    val termuxIntent =
+      selfRepo.buildTermuxRunCommandIntent(
+        workspaceName = "apkbuilder",
+        repoSlug = "Bakhshi7889/apkbuilder",
+        branch = "main",
+      )
     assertEquals("com.termux.RUN_COMMAND", termuxIntent.action)
     assertEquals("com.termux.app.RunCommandService", termuxIntent.component?.className)
-    assertEquals(wsDir.absolutePath, termuxIntent.getStringExtra("com.termux.RUN_COMMAND_WORKDIR"))
+    assertEquals(
+      SelfUpdateRepository.TERMUX_HOME,
+      termuxIntent.getStringExtra("com.termux.RUN_COMMAND_WORKDIR"),
+    )
+    val args = termuxIntent.getStringArrayExtra("com.termux.RUN_COMMAND_ARGUMENTS")!!
+    assertEquals("-lc", args[0])
+    assertTrue(args[1].contains("Bakhshi7889/apkbuilder"))
+    assertTrue(args[1].contains("debug.keystore.base64"))
+    assertTrue(args[1].contains("android.aapt2FromMavenOverride"))
+    assertTrue(args[1].contains("commandlinetools-linux"))
+    assertTrue(args[1].contains("termux-open"))
+
+    val setupOneLiner =
+      selfRepo.buildTermuxEnableExternalAppsOneLiner(
+        workspaceName = "apkbuilder",
+        repoSlug = "Bakhshi7889/apkbuilder",
+      )
+    assertTrue(setupOneLiner.contains("allow-external-apps=true"))
 
     val yaml = selfRepo.defaultGitHubActionsWorkflowYaml()
     assertTrue(yaml.contains("assembleDebug"))
@@ -353,6 +384,39 @@ class TermForgeRobolectricTest {
   }
 
   @Test
+  fun shellEngine_setsNativeLibDirEnvResolvesLibSoAndRunsBuiltins(): Unit = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val fakeNativeDir = File(context.cacheDir, "fake_native_libs").apply {
+      deleteRecursively()
+      mkdirs()
+    }
+    context.applicationInfo.nativeLibraryDir = fakeNativeDir.absolutePath
+    val libTool = File(fakeNativeDir, "libdummytool.so").apply {
+      writeText("#!/bin/sh\necho ok\n")
+      setExecutable(true)
+    }
+
+    val engine = ShellEngine(context)
+    val snap = engine.currentEnvSnapshot()
+    assertEquals(fakeNativeDir.absolutePath, snap["NATIVE_LIB_DIR"])
+    assertTrue(snap["PATH"].orEmpty().contains(fakeNativeDir.absolutePath))
+    assertTrue(snap["LD_LIBRARY_PATH"].orEmpty().contains(fakeNativeDir.absolutePath))
+    assertTrue(engine.listBundledNativeTools().contains("libdummytool.so"))
+
+    val toolsEvents = engine.executeCommand("tools").toList()
+    val toolsLines = toolsEvents.filterIsInstance<ShellEvent.Line>().map { it.text }
+    assertTrue(toolsLines.any { it.contains("libdummytool.so") })
+
+    val exportEvents = engine.executeCommand("export APKBUILDER_MODE=in_app").toList()
+    assertEquals(0, exportEvents.filterIsInstance<ShellEvent.Finished>().single().exitCode)
+    assertEquals("in_app", engine.currentEnvSnapshot()["APKBUILDER_MODE"])
+
+    val pwdEvents = engine.executeCommand("pwd").toList()
+    assertTrue(pwdEvents.filterIsInstance<ShellEvent.Line>().any { it.text == engine.homeDir.absolutePath })
+    assertTrue(libTool.delete())
+  }
+
+  @Test
   fun appUi_rendersAt360dpWith13xFontScaleAndSwitchesBetweenTabs() {
     RuntimeEnvironment.setFontScale(1.3f)
     composeTestRule.setContent {
@@ -363,6 +427,7 @@ class TermForgeRobolectricTest {
 
     composeTestRule.onNodeWithTag("nav_apps").assertIsDisplayed()
     composeTestRule.onNodeWithTag("nav_build").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("nav_shell").assertIsDisplayed()
     composeTestRule.onNodeWithTag("nav_sign").assertIsDisplayed()
     composeTestRule.onNodeWithTag("builder_import_github_button").assertIsDisplayed()
 
@@ -374,6 +439,26 @@ class TermForgeRobolectricTest {
     composeTestRule.onNodeWithTag("nav_apps").performClick()
     composeTestRule.onNodeWithTag("self_update_card").assertIsDisplayed()
     composeTestRule.onNodeWithTag("self_update_run_button").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("self_open_shell_button").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("self_inline_token_toggle").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("self_external_termux_toggle").assertIsDisplayed()
+
+    // External Termux APK links stay hidden behind the optional disclosure by default
+    composeTestRule.onNodeWithTag("self_install_termux_button").assertDoesNotExist()
+
+    composeTestRule.onNodeWithTag("self_inline_token_toggle").performClick()
+    composeTestRule.onNodeWithTag("apps_lazy_column").performScrollToNode(hasTestTag("self_inline_token_input"))
+    composeTestRule.onNodeWithTag("self_inline_token_input").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("self_inline_token_toggle").performClick()
+
+    composeTestRule.onNodeWithTag("apps_lazy_column").performScrollToNode(hasTestTag("self_external_termux_toggle"))
+    composeTestRule.onNodeWithTag("self_external_termux_toggle").performClick()
+    composeTestRule.onNodeWithTag("apps_lazy_column").performScrollToNode(hasTestTag("self_install_termux_button"))
+    composeTestRule.onNodeWithTag("self_install_termux_button").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("self_copy_termux_setup_button").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("self_external_termux_toggle").performClick()
+
+    composeTestRule.onNodeWithTag("apps_lazy_column").performScrollToNode(hasTestTag("self_repo_toggle"))
     composeTestRule.onNodeWithTag("self_repo_toggle").performClick()
     composeTestRule.onNodeWithTag("self_repo_input").assertIsDisplayed()
     composeTestRule.onNodeWithTag("self_repo_save_button").assertIsDisplayed()
@@ -382,6 +467,7 @@ class TermForgeRobolectricTest {
     composeTestRule.onNodeWithTag("self_ci_yaml_preview").assertIsDisplayed()
     composeTestRule.onNodeWithTag("self_ci_yaml_toggle").performClick()
     composeTestRule.onNodeWithTag("self_repo_toggle").performClick()
+
     composeTestRule.onNodeWithTag("apps_lazy_column").performScrollToNode(hasTestTag("apps_summary_card"))
     composeTestRule.onNodeWithTag("apps_summary_card").assertIsDisplayed()
     composeTestRule.onNodeWithTag("apps_auto_check_chip").assertIsDisplayed()
@@ -390,6 +476,26 @@ class TermForgeRobolectricTest {
     composeTestRule.onNodeWithTag("apps_add_toggle_button").performClick()
     composeTestRule.onNodeWithTag("apps_add_input").assertIsDisplayed()
     composeTestRule.onNodeWithTag("apps_add_submit_button").assertIsDisplayed()
+
+    composeTestRule.onNodeWithTag("nav_shell").performClick()
+    composeTestRule.onNodeWithTag("shell_diagnostics_toggle").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("shell_output_box").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("shell_command_input").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("shell_run_button").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("shell_chip_help").performClick()
+    composeTestRule.waitUntil(timeoutMillis = 5000L) {
+      composeTestRule.onAllNodes(hasText("Built-In APK Builder CLI commands:", substring = true))
+        .fetchSemanticsNodes().isNotEmpty()
+    }
+    composeTestRule.onNodeWithTag("shell_diagnostics_toggle").performClick()
+    composeTestRule.onNodeWithTag("shell_diagnostics_panel").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("shell_diagnostics_toggle").performClick()
+    composeTestRule.onNodeWithTag("shell_command_input").performTextInput("probe")
+    composeTestRule.onNodeWithTag("shell_run_button").performClick()
+    composeTestRule.waitUntil(timeoutMillis = 5000L) {
+      composeTestRule.onAllNodes(hasText("NATIVE_LIB_DIR:", substring = true))
+        .fetchSemanticsNodes().isNotEmpty()
+    }
 
     composeTestRule.onNodeWithTag("nav_sign").performClick()
     composeTestRule.onNodeWithTag("sign_apk_action_button").assertIsDisplayed()

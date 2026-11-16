@@ -27,6 +27,7 @@ import com.example.data.ProjectRepository
 import com.example.data.SelfUpdateConfig
 import com.example.data.SelfUpdateRepository
 import com.example.data.ShellEngine
+import com.example.data.ShellEvent
 import com.example.data.SigningResult
 import com.example.data.SystemEnvironmentInfo
 import com.example.data.UpdateNotifier
@@ -48,6 +49,7 @@ import kotlinx.coroutines.launch
 enum class AppTab {
   APPS,
   BUILD,
+  SHELL,
   SIGN,
 }
 
@@ -55,6 +57,18 @@ enum class BuildMode {
   DEVICE_GRADLE,
   CLOUD_GITHUB_ACTIONS,
 }
+
+data class ShellUiState(
+  val commandInput: String = "",
+  val currentDir: String = "",
+  val outputLines: List<String> = emptyList(),
+  val commandHistory: List<String> = emptyList(),
+  val isRunning: Boolean = false,
+  val lastExitCode: Int? = null,
+  val lastDurationMs: Long? = null,
+  val envInfo: SystemEnvironmentInfo? = null,
+  val isDiagnosticsExpanded: Boolean = false,
+)
 
 data class BuilderUiState(
   val workspaces: List<AndroidProjectSummary> = emptyList(),
@@ -77,6 +91,7 @@ data class BuilderUiState(
   val isMoreSourcesExpanded: Boolean = false,
   val isProjectSwitcherExpanded: Boolean = false,
   val isToolchainExpanded: Boolean = false,
+  val isExternalTermuxExpanded: Boolean = false,
   val envInfo: SystemEnvironmentInfo? = null,
   val isFilesExpanded: Boolean = false,
   val expandedFilePath: String? = null,
@@ -124,12 +139,16 @@ data class SelfUpdateUiState(
   val config: SelfUpdateConfig,
   val repoInput: String = config.repoSlug,
   val isConfigExpanded: Boolean = false,
+  val isInlineTokenExpanded: Boolean = false,
   val isCiYamlExpanded: Boolean = false,
+  val isExternalTermuxExpanded: Boolean = false,
+  val hasGitHubToken: Boolean = false,
   val isRunningSelfUpdate: Boolean = false,
   val pipelineStep: String? = null,
   val stagedWorkspacePath: String? = null,
   val stagedScriptName: String = "build_offline.sh",
   val termuxInstalled: Boolean = false,
+  val hasTermuxPermission: Boolean = false,
   val hasNewRemoteUpdate: Boolean = false,
   val remoteSha: String? = null,
   val remoteReleaseTag: String? = null,
@@ -183,6 +202,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     MutableStateFlow(
       SelfUpdateUiState(
         config = selfUpdateRepository.loadConfig(),
+        hasGitHubToken = gitHubRepository.getSavedToken().isNotBlank(),
       )
     )
   val selfUpdateState: StateFlow<SelfUpdateUiState> = _selfUpdateState.asStateFlow()
@@ -193,12 +213,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
   val builderState: StateFlow<BuilderUiState> = _builderState.asStateFlow()
 
+  private val _shellState =
+    MutableStateFlow(
+      ShellUiState(
+        currentDir = shellEngine.currentWorkingDir.absolutePath,
+        outputLines =
+          listOf(
+            "APK Builder Built-In Shell (/system/bin/sh + NATIVE_LIB_DIR + APK/GitHub CLI)",
+            "Type 'help' or tap a quick command chip below.",
+          ),
+      )
+    )
+  val shellState: StateFlow<ShellUiState> = _shellState.asStateFlow()
+
   private val _signState = MutableStateFlow(SignUiState())
   val signState: StateFlow<SignUiState> = _signState.asStateFlow()
 
   private var buildJob: Job? = null
   private var importJob: Job? = null
   private var actionsPollJob: Job? = null
+  private var shellJob: Job? = null
 
   init {
     refreshEnvironment()
@@ -214,6 +248,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshWorkspaces(selectFirst = false)
       }
       AppTab.BUILD -> refreshWorkspaces(selectFirst = false)
+      AppTab.SHELL -> refreshEnvironment()
       AppTab.SIGN -> refreshSigningAssets()
     }
   }
@@ -222,12 +257,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     viewModelScope.launch {
       val info = shellEngine.inspectEnvironment()
       _builderState.update { it.copy(envInfo = info) }
-      _selfUpdateState.update { it.copy(termuxInstalled = info.termuxInstalled) }
+      _shellState.update {
+        it.copy(
+          envInfo = info,
+          currentDir = shellEngine.currentWorkingDir.absolutePath,
+        )
+      }
+      _selfUpdateState.update {
+        it.copy(
+          termuxInstalled = info.termuxInstalled,
+          hasTermuxPermission = info.hasTermuxPermission,
+          hasGitHubToken = _builderState.value.gitHubTokenInput.isNotBlank(),
+        )
+      }
     }
   }
 
   fun toggleToolchainExpanded() {
     _builderState.update { it.copy(isToolchainExpanded = !it.isToolchainExpanded) }
+  }
+
+  fun toggleBuilderExternalTermux() {
+    _builderState.update { it.copy(isExternalTermuxExpanded = !it.isExternalTermuxExpanded) }
+  }
+
+  fun toggleSelfExternalTermux() {
+    _selfUpdateState.update { it.copy(isExternalTermuxExpanded = !it.isExternalTermuxExpanded) }
+  }
+
+  fun toggleSelfInlineToken() {
+    _selfUpdateState.update { it.copy(isInlineTokenExpanded = !it.isInlineTokenExpanded) }
   }
 
   fun refreshWorkspaces(selectFirst: Boolean = false) {
@@ -295,6 +354,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
   fun updateGitHubTokenInput(value: String) {
     gitHubRepository.saveToken(value)
     _builderState.update { it.copy(gitHubTokenInput = value) }
+    _selfUpdateState.update { it.copy(hasGitHubToken = value.trim().isNotBlank()) }
   }
 
   fun toggleGitHubSearchAndroidFilter() {
@@ -1123,19 +1183,143 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
   fun createTermuxLaunchIntent(): Intent? = shellEngine.createLaunchTermuxIntent()
 
-  fun prepareActiveWorkspaceTermuxIntent(): Intent? {
-    val active = _builderState.value.activeProject ?: return null
-    val scriptName = if (_builderState.value.gradleOnlineMode) "build_online.sh" else "build_offline.sh"
-    val oneLiner =
-      selfUpdateRepository.buildOneLineTermuxShellCommand(
-        workspaceName = active.workspaceName,
-        scriptFileName = scriptName,
+  fun createInstallTermuxIntent(): Intent = shellEngine.createInstallTermuxIntent()
+
+  fun launchActiveWorkspaceInTermux(onDispatch: (Intent) -> Unit) {
+    val active = _builderState.value.activeProject ?: return
+    val meta = _builderState.value.activeGitHubMeta
+    val online = _builderState.value.gradleOnlineMode
+    val env = _builderState.value.envInfo
+    val cpuCores = env?.cpuCores ?: Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+    val heapMb = env?.recommendedHeapMb ?: 1920
+
+    viewModelScope.launch {
+      val slug = meta?.let { "${it.owner}/${it.repo}" }
+      val branch = meta?.branch ?: "main"
+      val zipName =
+        if (slug == null) {
+          projectRepository.stageWorkspaceZipToPublicDownloads(active.rootPath, active.workspaceName)
+        } else {
+          null
+        }
+      val oneLiner =
+        selfUpdateRepository.buildTermuxEnableExternalAppsOneLiner(
+          workspaceName = active.workspaceName,
+          repoSlug = slug,
+          branch = branch,
+          onlineGradle = online,
+          cpuCores = cpuCores,
+          heapMb = heapMb,
+          localDownloadsZipName = zipName,
+        )
+      copyTextToClipboard("APK Builder Termux command", oneLiner)
+      val intent =
+        selfUpdateRepository.buildTermuxRunCommandIntent(
+          workspaceName = active.workspaceName,
+          repoSlug = slug,
+          branch = branch,
+          onlineGradle = online,
+          cpuCores = cpuCores,
+          heapMb = heapMb,
+          localDownloadsZipName = zipName,
+        )
+      onDispatch(intent)
+    }
+  }
+
+  fun copyTermuxSetupCommand(forSelfUpdate: Boolean) {
+    val env = _builderState.value.envInfo
+    val cpuCores = env?.cpuCores ?: Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+    val heapMb = env?.recommendedHeapMb ?: 1920
+    if (forSelfUpdate) {
+      val config = selfUpdateRepository.loadConfig()
+      val slug = config.repoSlug.takeIf { it.isNotBlank() }
+      val workspaceName =
+        _selfUpdateState.value.stagedWorkspacePath?.let { File(it).name } ?: "apkbuilder"
+      val cmd =
+        selfUpdateRepository.buildTermuxEnableExternalAppsOneLiner(
+          workspaceName = workspaceName,
+          repoSlug = slug,
+          branch = config.branch,
+          onlineGradle = true,
+          cpuCores = cpuCores,
+          heapMb = heapMb,
+        )
+      copyTextToClipboard("APK Builder Termux Setup", cmd)
+      _selfUpdateState.update {
+        it.copy(
+          pipelineStep = null,
+          statusMessage = "Copied Termux setup & build command. Paste once inside Termux.",
+          isErrorStatus = false,
+        )
+      }
+    } else {
+      val active = _builderState.value.activeProject
+      val meta = _builderState.value.activeGitHubMeta
+      val cmd =
+        selfUpdateRepository.buildTermuxEnableExternalAppsOneLiner(
+          workspaceName = active?.workspaceName ?: "apkbuilder",
+          repoSlug = meta?.let { "${it.owner}/${it.repo}" },
+          branch = meta?.branch ?: "main",
+          onlineGradle = _builderState.value.gradleOnlineMode,
+          cpuCores = cpuCores,
+          heapMb = heapMb,
+        )
+      copyTextToClipboard("APK Builder Termux Setup", cmd)
+      _builderState.update {
+        it.copy(
+          statusMessage = "Copied Termux setup & build command. Paste once inside Termux.",
+          isErrorStatus = false,
+        )
+      }
+    }
+  }
+
+  fun onTermuxPermissionResult(granted: Boolean) {
+    refreshEnvironment()
+    val msg =
+      if (granted) {
+        "Termux RUN_COMMAND permission granted — ready to build on Termux backend."
+      } else {
+        "Termux RUN_COMMAND permission denied. Tap Copy Setup Cmd to run manually in Termux."
+      }
+    _selfUpdateState.update {
+      it.copy(
+        hasTermuxPermission = granted,
+        pipelineStep = null,
+        statusMessage = msg,
+        isErrorStatus = !granted,
       )
-    copyTextToClipboard("TermForge Termux command", oneLiner)
-    return selfUpdateRepository.buildTermuxRunCommandIntent(
-      workspaceDir = File(active.rootPath),
-      scriptFileName = scriptName,
-    )
+    }
+    _builderState.update {
+      it.copy(
+        statusMessage = msg,
+        isErrorStatus = !granted,
+      )
+    }
+  }
+
+  fun onTermuxDispatchResult(dispatched: Boolean, errorDetail: String?) {
+    val msg =
+      if (dispatched) {
+        "Launched build in Termux backend. Check Termux — also copied command to clipboard if external-apps prompt appears."
+      } else {
+        "Opened Termux + copied setup command. Paste once in Termux to enable external-apps & build" +
+          (errorDetail?.let { " ($it)." } ?: ".")
+      }
+    _selfUpdateState.update {
+      it.copy(
+        pipelineStep = null,
+        statusMessage = msg,
+        isErrorStatus = false,
+      )
+    }
+    _builderState.update {
+      it.copy(
+        statusMessage = msg,
+        isErrorStatus = false,
+      )
+    }
   }
 
   private fun copyTextToClipboard(label: String, text: String) {
@@ -1144,7 +1328,285 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     clipboard.setPrimaryClip(ClipData.newPlainText(label, text))
   }
 
-  // --- Self-Update Actions (On-Device Gradle Primary + Cloud Actions Fallback) ---
+  // --- Built-In Interactive Shell Console ---
+
+  fun openBuiltInShell(initialCommand: String? = null) {
+    _activeTab.value = AppTab.SHELL
+    refreshEnvironment()
+    if (!initialCommand.isNullOrBlank()) {
+      runShellCommand(initialCommand)
+    }
+  }
+
+  fun updateShellCommandInput(value: String) {
+    _shellState.update { it.copy(commandInput = value) }
+  }
+
+  fun toggleShellDiagnostics() {
+    _shellState.update { it.copy(isDiagnosticsExpanded = !it.isDiagnosticsExpanded) }
+  }
+
+  fun recallPreviousShellCommand() {
+    val last = _shellState.value.commandHistory.lastOrNull() ?: return
+    _shellState.update { it.copy(commandInput = last) }
+  }
+
+  fun stopShellCommand() {
+    shellEngine.stopActiveProcess()
+    shellJob?.cancel()
+    shellJob = null
+    _shellState.update {
+      it.copy(
+        isRunning = false,
+        outputLines = appendShellLines(it.outputLines, listOf("[stopped by user]")),
+      )
+    }
+  }
+
+  fun runShellCommand(overrideCommand: String? = null) {
+    val raw = (overrideCommand ?: _shellState.value.commandInput).trim()
+    if (raw.isEmpty()) return
+    if (_shellState.value.isRunning) return
+
+    if (overrideCommand == null) {
+      _shellState.update { it.copy(commandInput = "") }
+    }
+
+    if (raw == "clear") {
+      _shellState.update {
+        it.copy(
+          outputLines = emptyList(),
+          lastExitCode = 0,
+          lastDurationMs = 0L,
+        )
+      }
+      return
+    }
+
+    val promptLine = "$ $raw"
+    _shellState.update { state ->
+      val updatedHistory =
+        if (state.commandHistory.lastOrNull() == raw) state.commandHistory
+        else (state.commandHistory + raw).takeLast(30)
+      state.copy(
+        isRunning = true,
+        commandHistory = updatedHistory,
+        outputLines = appendShellLines(state.outputLines, listOf(promptLine)),
+      )
+    }
+
+    shellJob?.cancel()
+    shellJob =
+      viewModelScope.launch {
+        val handledBuiltin = tryHandleApkBuilderCli(raw)
+        if (!handledBuiltin) {
+          shellEngine.executeCommand(raw).collect { event ->
+            when (event) {
+              is ShellEvent.Line -> {
+                _shellState.update { s ->
+                  s.copy(outputLines = appendShellLines(s.outputLines, listOf(event.text)))
+                }
+              }
+              is ShellEvent.Finished -> {
+                _shellState.update { s ->
+                  s.copy(
+                    isRunning = false,
+                    currentDir = event.newCwd,
+                    lastExitCode = event.exitCode,
+                    lastDurationMs = event.durationMs,
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+  }
+
+  private suspend fun tryHandleApkBuilderCli(raw: String): Boolean {
+    val parts = raw.split(Regex("""\s+""")).filter { it.isNotBlank() }
+    val cmd = parts.firstOrNull()?.lowercase() ?: return false
+    val startMs = android.os.SystemClock.elapsedRealtime()
+
+    fun finishCli(lines: List<String>, exitCode: Int = 0) {
+      val dur = (android.os.SystemClock.elapsedRealtime() - startMs).coerceAtLeast(0L)
+      _shellState.update { s ->
+        s.copy(
+          isRunning = false,
+          lastExitCode = exitCode,
+          lastDurationMs = dur,
+          outputLines = appendShellLines(s.outputLines, lines),
+        )
+      }
+    }
+
+    when (cmd) {
+      "help" -> {
+        finishCli(
+          listOf(
+            "Built-In APK Builder CLI commands:",
+            "  help                  Show this command reference",
+            "  probe                 Inspect hardware, NATIVE_LIB_DIR, and binaries",
+            "  tools                 List bundled lib*.so CLIs & /system/bin tools",
+            "  gh-check <owner/repo> Check GitHub latest commit & Release APK",
+            "  gh-import <owner/repo> Download repo into workspaces/ with live speed",
+            "  apk-list              List available built/downloaded APKs",
+            "  apk-verify <name>     Verify v1/v2/v3 APK signature & SHA-256",
+            "  pwd / cd <dir>        Inspect or change shell working directory",
+            "  history / clear       Show command history or clear console",
+            "POSIX shell (/system/bin/sh): any standard command (ls, uname -a, env, cat, id, ...)",
+          )
+        )
+        return true
+      }
+      "history" -> {
+        val hist = _shellState.value.commandHistory
+        finishCli(
+          if (hist.isEmpty()) listOf("(history empty)")
+          else hist.mapIndexed { idx, c -> "  ${idx + 1}  $c" }
+        )
+        return true
+      }
+      "probe" -> {
+        val info = shellEngine.inspectEnvironment()
+        _builderState.update { it.copy(envInfo = info) }
+        _shellState.update { it.copy(envInfo = info) }
+        val totalMb = info.totalRamBytes / (1024L * 1024L)
+        val availMb = info.availRamBytes / (1024L * 1024L)
+        val lines = buildList {
+          add("Kernel: ${info.kernelName} ${info.kernelRelease} (${info.machineArch})")
+          add("ABIs: ${info.supportedAbis.joinToString(", ")}")
+          add("CPU/RAM: ${info.cpuCores} cores • $availMb/$totalMb MB free • Gradle -Xmx${info.recommendedHeapMb}m")
+          add("Workspaces: ${info.workspacesDir}")
+          add("NATIVE_LIB_DIR: ${info.nativeLibDir} (${info.bundledNativeBins.size} bundled libs)")
+          if (info.bundledNativeBins.isNotEmpty()) {
+            add("  Bundled: ${info.bundledNativeBins.joinToString(", ")}")
+          }
+          add("/system/bin: ${info.systemBinToolsCount} POSIX tools")
+          info.tools.filter { it.isAvailable }.forEach { t ->
+            add("  [ok] ${t.name} -> ${t.resolvedPath}")
+          }
+          add("  [cloud] GitHub Actions CI token: ${if (_builderState.value.gitHubTokenInput.isNotBlank()) "CONFIGURED" else "NOT SET"}")
+        }
+        finishCli(lines)
+        return true
+      }
+      "apk-list" -> {
+        val apks = signingService.listAvailableApks(projectRepository.workspacesRoot)
+        if (apks.isEmpty()) {
+          finishCli(listOf("No APKs found yet in workspaces/ or apks/. Import/build via GitHub or Sign tab."))
+        } else {
+          finishCli(
+            listOf("APKs (${apks.size}):") +
+              apks.map { f -> "  ${f.name} (${formatByteCount(f.length())}) — ${f.parentFile?.name}" }
+          )
+        }
+        return true
+      }
+      "apk-verify" -> {
+        val query = parts.getOrNull(1)
+        if (query.isNullOrBlank()) {
+          finishCli(listOf("error: Usage: apk-verify <filename-or-partial-name>"), exitCode = 2)
+          return true
+        }
+        val apks = signingService.listAvailableApks(projectRepository.workspacesRoot)
+        val target =
+          apks.firstOrNull { it.name.equals(query, ignoreCase = true) || it.absolutePath == query }
+            ?: apks.firstOrNull { it.name.contains(query, ignoreCase = true) }
+        if (target == null) {
+          finishCli(listOf("error: No APK matching '$query'. Run 'apk-list' first."), exitCode = 1)
+          return true
+        }
+        val v = signingService.verifyApk(target)
+        val sameAsApp = signingService.isSignatureCompatibleWithInstalled(v)
+        finishCli(
+          listOfNotNull(
+            "File: ${v.apkName} (${formatByteCount(v.sizeBytes)})",
+            "Verified: ${v.isVerified} (v1=${v.verifiedV1}, v2=${v.verifiedV2}, v3=${v.verifiedV3})",
+            v.signerSubject?.let { "Subject: $it" },
+            "Signer SHA-256: ${v.signerSha256 ?: "unsigned"}",
+            "Matches installed APK Builder cert: ${sameAsApp?.toString() ?: "unknown"}",
+            v.errorMessage?.let { "Error: $it" },
+          )
+        )
+        return true
+      }
+      "gh-check" -> {
+        val repoArg = parts.getOrNull(1) ?: selfUpdateRepository.loadConfig().repoSlug
+        if (repoArg.isBlank()) {
+          finishCli(listOf("error: Usage: gh-check <owner/repo>"), exitCode = 2)
+          return true
+        }
+        val token = _builderState.value.gitHubTokenInput.trim()
+        runCatching {
+          gitHubRepository.fetchRepoRemoteSnapshot(repoArg, tokenOverride = token)
+        }.onSuccess { snap ->
+          finishCli(
+            listOf(
+              "Repo: ${snap.owner}/${snap.repo} (${snap.branch})",
+              "Latest Commit: ${snap.remoteSha.take(10)} — ${snap.remoteMessage}",
+              "Author: ${snap.remoteAuthor} (${snap.remoteDate})",
+              "Release Tag: ${snap.latestReleaseTag ?: "none"} | Asset APK: ${snap.latestApkName ?: "none"}",
+            )
+          )
+        }.onFailure { err ->
+          finishCli(listOf("error: ${err.message ?: "GitHub check failed"}"), exitCode = 1)
+        }
+        return true
+      }
+      "gh-import" -> {
+        val repoArg = parts.getOrNull(1)
+        if (repoArg.isNullOrBlank()) {
+          finishCli(listOf("error: Usage: gh-import <owner/repo>"), exitCode = 2)
+          return true
+        }
+        val token = _builderState.value.gitHubTokenInput.trim()
+        var lastLine = ""
+        runCatching {
+          gitHubRepository.importFromGitHub(repoArg, token) { p ->
+            val msg =
+              if (p.bytesTotal > 0L) {
+                "${p.label} ${formatByteCount(p.bytesDone)}/${formatByteCount(p.bytesTotal)} (${formatByteCount(p.bytesPerSec)}/s)"
+              } else {
+                p.label
+              }
+            if (msg != lastLine && p.bytesDone > 0L) {
+              lastLine = msg
+              _shellState.update { s ->
+                s.copy(outputLines = appendShellLines(s.outputLines, listOf("  $msg")))
+              }
+            }
+          }
+        }.onSuccess { summary ->
+          val list = projectRepository.listWorkspaces()
+          _builderState.update {
+            it.copy(
+              workspaces = list,
+              activeProject = summary,
+              activeGitHubMeta = gitHubRepository.readMeta(File(summary.rootPath)),
+            )
+          }
+          finishCli(
+            listOf(
+              "Imported ${summary.workspaceName} (${summary.fileCount} files, ${summary.sourceFileCount} Kotlin/Java sources)",
+              "Location: ${summary.rootPath}",
+            )
+          )
+        }.onFailure { err ->
+          finishCli(listOf("error: ${err.message ?: "Import failed"}"), exitCode = 1)
+        }
+        return true
+      }
+      else -> return false
+    }
+  }
+
+  private fun appendShellLines(existing: List<String>, added: List<String>): List<String> {
+    val combined = existing + added
+    return if (combined.size > 400) combined.takeLast(400) else combined
+  }
+
+  // --- Self-Update Actions (In-App Sandbox / Release APK / Automated Cloud Actions — No External Termux Required) ---
 
   fun toggleSelfUpdateConfig() {
     _selfUpdateState.update { it.copy(isConfigExpanded = !it.isConfigExpanded) }
@@ -1232,6 +1694,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         it.copy(
           config = currentConfig,
           termuxInstalled = env.termuxInstalled,
+          hasTermuxPermission = env.hasTermuxPermission,
+          hasGitHubToken = token.isNotBlank(),
           isRunningSelfUpdate = true,
           pipelineStep = "Checking ${currentConfig.repoSlug} on GitHub…",
           candidateApk = null,
@@ -1256,7 +1720,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
           )
         }
 
-        // Find matching local workspace or import it
+        // 1) Sync local workspace for source inspection & script/signing verification
         val existingWorkspace =
           _builderState.value.workspaces.firstOrNull { ws ->
             val meta = gitHubRepository.readMeta(File(ws.rootPath))
@@ -1282,7 +1746,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
           it.copy(
             stagedWorkspacePath = workspaceSummary.rootPath,
             stagedScriptName = "build_offline.sh",
-            pipelineStep = "Running hardened on-device Gradle pipeline…",
+            pipelineStep = "Checking built-in runtime (NATIVE_LIB_DIR / sandbox)…",
           )
         }
 
@@ -1300,92 +1764,212 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
           )
         }
 
-        Triple(snap, workspaceSummary, outcome)
-      }.onSuccess { (snap, workspaceSummary, outcome) ->
-        when (outcome?.status) {
-          BuildOutcomeStatus.APK_BUILT -> {
-            val apkRelOrAbs = outcome.apkPaths.firstOrNull()
-            val apkFile =
-              apkRelOrAbs?.let { p ->
-                File(p).takeIf { it.isAbsolute && it.exists() } ?: File(workspaceSummary.rootPath, p)
-              }
-            val verified = apkFile?.let { signingService.verifyApk(it) }
-            val sigMatch = verified?.let { signingService.isSignatureCompatibleWithInstalled(it) }
-            if (verified != null) refreshSigningAssets(selectApkFile = File(verified.apkPath))
+        // 2) If local sandbox / NATIVE_LIB_DIR built an APK natively, verify & return it
+        if (outcome?.status == BuildOutcomeStatus.APK_BUILT) {
+          val apkRelOrAbs = outcome?.apkPaths?.firstOrNull()
+          val apkFile =
+            apkRelOrAbs?.let { p ->
+              File(p).takeIf { it.isAbsolute && it.exists() } ?: File(workspaceSummary.rootPath, p)
+            }
+          if (apkFile != null && apkFile.exists()) {
+            val verified = signingService.verifyApk(apkFile)
+            val sigMatch = signingService.isSignatureCompatibleWithInstalled(verified)
+            refreshSigningAssets(selectApkFile = apkFile)
             _selfUpdateState.update {
               it.copy(
                 isRunningSelfUpdate = false,
-                pipelineStep = "On-device Gradle succeeded! Export or Share APK to install update.",
+                pipelineStep = null,
                 candidateApk = verified,
                 signatureMatchesInstalled = sigMatch,
                 hasNewRemoteUpdate = true,
                 statusMessage =
                   if (sigMatch == false) {
-                    "APK built! Signature differs from installed app — re-sign with matching keystore in Sign tab before installing."
+                    "APK built! Signature differs from installed app — re-sign in Sign tab before installing."
                   } else {
-                    "Self-update APK built cleanly (${verified?.apkName ?: "debug APK"})."
+                    "Self-update APK built natively (${verified.apkName})."
                   },
                 isErrorStatus = false,
               )
             }
+            return@runCatching
           }
-          else -> {
-            // Toolchain missing inside Android sandbox or local failure:
-            // Try Release APK fallback automatically if one is attached on GitHub, otherwise guide Termux + Cloud CI.
-            val apkUrl = snap.latestApkUrl
-            val apkName = snap.latestApkName
-            if (!apkUrl.isNullOrBlank() && !apkName.isNullOrBlank()) {
-              _selfUpdateState.update {
-                it.copy(pipelineStep = "Sandbox lacks java/gradle — fetching Release $apkName fallback…")
-              }
-              val downloaded =
-                runCatching { gitHubRepository.downloadReleaseApk(apkUrl, apkName, token) {} }.getOrNull()
-              if (downloaded != null) {
-                val verified = signingService.verifyApk(downloaded)
-                val sigMatch = signingService.isSignatureCompatibleWithInstalled(verified)
-                refreshSigningAssets(selectApkFile = downloaded)
-                _selfUpdateState.update {
-                  it.copy(
-                    isRunningSelfUpdate = false,
+        }
+
+        // 3) No separate Termux needed: if GitHub Release already has an APK, download it live inside app
+        val apkUrl = snap.latestApkUrl
+        val apkName = snap.latestApkName
+        if (!apkUrl.isNullOrBlank() && !apkName.isNullOrBlank()) {
+          _selfUpdateState.update {
+            it.copy(pipelineStep = "Downloading Release $apkName from GitHub…")
+          }
+          val downloaded =
+            runCatching {
+              gitHubRepository.downloadReleaseApk(apkUrl, apkName, token) { p ->
+                val speed = if (p.bytesPerSec > 0L) " @ ${formatByteCount(p.bytesPerSec)}/s" else ""
+                _selfUpdateState.update { s ->
+                  s.copy(
                     pipelineStep =
-                      if (env.termuxInstalled) {
-                        "Downloaded Release APK fallback (${downloaded.name}). You can also tap Run in Termux to build from source on-device."
-                      } else {
-                        "Downloaded Release APK fallback (${downloaded.name})."
-                      },
-                    candidateApk = verified,
-                    signatureMatchesInstalled = sigMatch,
-                    hasNewRemoteUpdate = true,
-                    statusMessage = "Self-update APK ready from Release fallback (${downloaded.name}).",
-                    isErrorStatus = false,
+                      "Downloading $apkName: ${formatByteCount(p.bytesDone)}" +
+                        (if (p.bytesTotal > 0L) " / ${formatByteCount(p.bytesTotal)}" else "") +
+                        speed
                   )
                 }
-                return@onSuccess
               }
-            }
-
+            }.getOrNull()
+          if (downloaded != null && downloaded.exists()) {
+            val verified = signingService.verifyApk(downloaded)
+            val sigMatch = signingService.isSignatureCompatibleWithInstalled(verified)
+            refreshSigningAssets(selectApkFile = downloaded)
             _selfUpdateState.update {
               it.copy(
                 isRunningSelfUpdate = false,
+                pipelineStep = null,
+                candidateApk = verified,
+                signatureMatchesInstalled = sigMatch,
                 hasNewRemoteUpdate = true,
-                pipelineStep =
-                  if (env.termuxInstalled) {
-                    "Source synced & build_offline.sh hardened for ARM64. Tap Run in Termux to compile on-device via Gradle, or trigger Cloud GitHub Actions."
+                statusMessage =
+                  if (sigMatch == false) {
+                    "Downloaded ${downloaded.name}. Signature differs from installed app — re-sign in Sign tab."
                   } else {
-                    "Source synced & build_offline.sh generated. Android's app sandbox doesn't bundle JDK/Gradle — install Termux for on-device Gradle or tap Cloud Fallback."
+                    "Downloaded Release APK (${downloaded.name}) ready for update."
                   },
-                statusMessage = "Source synced (${snap.remoteSha.take(7)}). Choose Termux or Cloud Actions to finish APK.",
                 isErrorStatus = false,
               )
             }
+            return@runCatching
           }
+        }
+
+        // 4) No Release APK yet & Android targetSdk 36 W^X blocks OpenJDK/Gradle inside app sandbox:
+        //    Automate 1-tap GitHub Actions Cloud Build + artifact download right here inside Apps tab!
+        if (token.isNotBlank()) {
+          val owner = snap.owner
+          val repo = snap.repo
+          val branch = snap.branch
+          _selfUpdateState.update {
+            it.copy(pipelineStep = "Checking GitHub Actions workflow on $owner/$repo…")
+          }
+          var workflows = gitHubRepository.listWorkflows(owner, repo, token)
+          var targetWorkflow = workflows.firstOrNull { it.state == "active" }
+          if (targetWorkflow == null) {
+            _selfUpdateState.update {
+              it.copy(pipelineStep = "Installing .github/workflows/termforge-android.yml…")
+            }
+            gitHubRepository.createOrUpdateAndroidWorkflow(owner, repo, branch, token)
+            delay(2000L)
+            workflows = gitHubRepository.listWorkflows(owner, repo, token)
+            targetWorkflow = workflows.firstOrNull { it.state == "active" }
+          }
+          if (targetWorkflow == null) {
+            throw IllegalStateException("GitHub Actions workflow installed — tap Update Now again in a few seconds.")
+          }
+
+          val startedElapsed = android.os.SystemClock.elapsedRealtime()
+          _selfUpdateState.update {
+            it.copy(pipelineStep = "Triggering Cloud APK Build (${targetWorkflow.name}) on $branch…")
+          }
+          gitHubRepository.dispatchWorkflow(owner, repo, targetWorkflow.id, branch, token)
+
+          var completedRun: GitHubWorkflowRun? = null
+          for (poll in 1..60) {
+            delay(5000L)
+            val runs = runCatching { gitHubRepository.listWorkflowRuns(owner, repo, token) }.getOrNull()
+            val newest = runs?.firstOrNull { it.branch == branch } ?: runs?.firstOrNull()
+            val elapsedSec = ((android.os.SystemClock.elapsedRealtime() - startedElapsed) / 1000L)
+            if (newest != null) {
+              _selfUpdateState.update {
+                it.copy(
+                  pipelineStep =
+                    "Cloud CI Run #${newest.runNumber}: ${newest.status} (${formatDurationDetailed(elapsedSec)})"
+                )
+              }
+              if (newest.status == "completed") {
+                completedRun = newest
+                break
+              }
+            } else {
+              _selfUpdateState.update {
+                it.copy(
+                  pipelineStep =
+                    "Waiting for GitHub runner to start (${formatDurationDetailed(elapsedSec)})…"
+                )
+              }
+            }
+          }
+
+          val finalRun =
+            completedRun
+              ?: throw IllegalStateException(
+                "GitHub Actions build is still running after 5m — check progress in Build -> Cloud."
+              )
+          if (finalRun.conclusion != "success") {
+            throw IllegalStateException(
+              "Cloud CI Run #${finalRun.runNumber} finished with status '${finalRun.conclusion ?: "failed"}'."
+            )
+          }
+
+          _selfUpdateState.update {
+            it.copy(pipelineStep = "Fetching built APK artifact from Run #${finalRun.runNumber}…")
+          }
+          val artifacts = gitHubRepository.listRunArtifacts(owner, repo, finalRun.id, token)
+          val apkArtifact =
+            artifacts.firstOrNull { !it.expired && it.name.contains("apk", ignoreCase = true) }
+              ?: artifacts.firstOrNull { !it.expired }
+              ?: throw IllegalStateException("Run #${finalRun.runNumber} produced no downloadable APK artifacts.")
+
+          val extractedApks =
+            gitHubRepository.downloadAndExtractArtifactApk(apkArtifact, token) { p ->
+              val speed = if (p.bytesPerSec > 0L) " @ ${formatByteCount(p.bytesPerSec)}/s" else ""
+              _selfUpdateState.update { s ->
+                s.copy(
+                  pipelineStep =
+                    "Downloading ${apkArtifact.name}: ${formatByteCount(p.bytesDone)}" +
+                      (if (p.bytesTotal > 0L) " / ${formatByteCount(p.bytesTotal)}" else "") +
+                      speed
+                )
+              }
+            }
+          val builtApk = extractedApks.first()
+          val verified = signingService.verifyApk(builtApk)
+          val sigMatch = signingService.isSignatureCompatibleWithInstalled(verified)
+          refreshSigningAssets(selectApkFile = builtApk)
+          _selfUpdateState.update {
+            it.copy(
+              isRunningSelfUpdate = false,
+              pipelineStep = null,
+              candidateApk = verified,
+              signatureMatchesInstalled = sigMatch,
+              hasNewRemoteUpdate = true,
+              statusMessage =
+                if (sigMatch == false) {
+                  "Cloud APK built (${builtApk.name})! Re-sign in Sign tab so keystore matches installed app."
+                } else {
+                  "Cloud APK built cleanly (${builtApk.name}) — ready to export & install!"
+                },
+              isErrorStatus = false,
+            )
+          }
+          return@runCatching
+        }
+
+        // 5) No Release APK and no GitHub Token configured yet: open inline token disclosure cleanly
+        _selfUpdateState.update {
+          it.copy(
+            isRunningSelfUpdate = false,
+            hasNewRemoteUpdate = true,
+            isInlineTokenExpanded = true,
+            pipelineStep = null,
+            statusMessage =
+              "Synced ${snap.remoteSha.take(7)}. Add a GitHub token above for 1-tap in-app Cloud APK compilation (no separate Termux APK needed).",
+            isErrorStatus = false,
+          )
         }
       }.onFailure { err ->
         _selfUpdateState.update {
           it.copy(
             isRunningSelfUpdate = false,
             pipelineStep = null,
-            statusMessage = err.message ?: "Self-update check/sync failed.",
+            statusMessage = err.message ?: "Self-update pipeline failed.",
             isErrorStatus = true,
           )
         }
@@ -1426,16 +2010,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
   }
 
   fun prepareSelfTermuxRunIntent(): Intent? {
-    val path = _selfUpdateState.value.stagedWorkspacePath ?: return null
-    val dir = File(path)
-    val scriptName = _selfUpdateState.value.stagedScriptName
+    val config = selfUpdateRepository.loadConfig()
+    val slug = config.repoSlug.takeIf { it.isNotBlank() }
+    val path = _selfUpdateState.value.stagedWorkspacePath
+    if (slug == null && path == null) return null
+    val workspaceName = path?.let { File(it).name } ?: "apkbuilder"
+    val env = _builderState.value.envInfo
+    val cpuCores = env?.cpuCores ?: Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+    val heapMb = env?.recommendedHeapMb ?: 1920
     val oneLiner =
-      selfUpdateRepository.buildOneLineTermuxShellCommand(
-        workspaceName = dir.name,
-        scriptFileName = scriptName,
+      selfUpdateRepository.buildTermuxEnableExternalAppsOneLiner(
+        workspaceName = workspaceName,
+        repoSlug = slug,
+        branch = config.branch,
+        onlineGradle = true,
+        cpuCores = cpuCores,
+        heapMb = heapMb,
       )
-    copyTextToClipboard("TermForge Self-Update Termux command", oneLiner)
-    return selfUpdateRepository.buildTermuxRunCommandIntent(dir, scriptName)
+    copyTextToClipboard("APK Builder Self-Update Termux command", oneLiner)
+    return selfUpdateRepository.buildTermuxRunCommandIntent(
+      workspaceName = workspaceName,
+      repoSlug = slug,
+      branch = config.branch,
+      onlineGradle = true,
+      cpuCores = cpuCores,
+      heapMb = heapMb,
+    )
   }
 
   fun buildShareApkIntent(apkPath: String): Intent? {
@@ -1477,6 +2077,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     _appsState.update {
       it.copy(canPostNotifications = updateNotifier.canPostNotifications())
     }
+    refreshEnvironment()
   }
 
   fun toggleAddWatchedAppForm() {

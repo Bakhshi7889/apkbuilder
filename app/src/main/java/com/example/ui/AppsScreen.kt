@@ -68,6 +68,7 @@ import com.example.ui.theme.JetBrainsMono
 import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.SystemUpdate
@@ -84,6 +85,9 @@ private val AppsMorphSpring =
 fun AppsScreen(
   state: AppsUiState,
   selfUpdateState: SelfUpdateUiState,
+  gitHubTokenInput: String,
+  onGitHubTokenChange: (String) -> Unit,
+  onToggleSelfInlineToken: () -> Unit,
   onToggleSelfConfig: () -> Unit,
   onSelfRepoInputChange: (String) -> Unit,
   onSaveSelfRepo: () -> Unit,
@@ -91,7 +95,12 @@ fun AppsScreen(
   onCopySelfCiYaml: (String) -> Unit,
   starterCiYaml: String,
   onRunSelfUpdate: () -> Unit,
+  onOpenBuiltInShell: () -> Unit,
+  onToggleSelfExternalTermux: () -> Unit,
   onRunSelfInTermux: () -> Unit,
+  onInstallTermux: () -> Unit,
+  onRequestTermuxPermission: () -> Unit,
+  onCopySelfTermuxSetup: () -> Unit,
   onOpenSelfCloudBuild: () -> Unit,
   onExportSelfApk: (String) -> Unit,
   onShareSelfApk: (String) -> Unit,
@@ -119,12 +128,15 @@ fun AppsScreen(
 
       LazyColumn(
         modifier = Modifier.fillMaxWidth().weight(1f).testTag("apps_lazy_column"),
-        contentPadding = PaddingValues(bottom = 12.dp),
+        contentPadding = PaddingValues(bottom = 20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
       ) {
         item(key = "self_update_card") {
           SelfUpdateCard(
             state = selfUpdateState,
+            gitHubTokenInput = gitHubTokenInput,
+            onGitHubTokenChange = onGitHubTokenChange,
+            onToggleInlineToken = onToggleSelfInlineToken,
             starterCiYaml = starterCiYaml,
             onToggleConfig = onToggleSelfConfig,
             onRepoInputChange = onSelfRepoInputChange,
@@ -132,7 +144,12 @@ fun AppsScreen(
             onToggleCiYaml = onToggleSelfCiYaml,
             onCopyCiYaml = { onCopySelfCiYaml(starterCiYaml) },
             onRunSelfUpdate = onRunSelfUpdate,
+            onOpenBuiltInShell = onOpenBuiltInShell,
+            onToggleExternalTermux = onToggleSelfExternalTermux,
             onRunInTermux = onRunSelfInTermux,
+            onInstallTermux = onInstallTermux,
+            onRequestTermuxPermission = onRequestTermuxPermission,
+            onCopyTermuxSetup = onCopySelfTermuxSetup,
             onOpenCloudBuild = onOpenSelfCloudBuild,
             onExportApk = onExportSelfApk,
             onShareApk = onShareSelfApk,
@@ -782,6 +799,9 @@ private fun WatchedAppCard(
 @Composable
 private fun SelfUpdateCard(
   state: SelfUpdateUiState,
+  gitHubTokenInput: String,
+  onGitHubTokenChange: (String) -> Unit,
+  onToggleInlineToken: () -> Unit,
   starterCiYaml: String,
   onToggleConfig: () -> Unit,
   onRepoInputChange: (String) -> Unit,
@@ -789,7 +809,12 @@ private fun SelfUpdateCard(
   onToggleCiYaml: () -> Unit,
   onCopyCiYaml: () -> Unit,
   onRunSelfUpdate: () -> Unit,
+  onOpenBuiltInShell: () -> Unit,
+  onToggleExternalTermux: () -> Unit,
   onRunInTermux: () -> Unit,
+  onInstallTermux: () -> Unit,
+  onRequestTermuxPermission: () -> Unit,
+  onCopyTermuxSetup: () -> Unit,
   onOpenCloudBuild: () -> Unit,
   onExportApk: (String) -> Unit,
   onShareApk: (String) -> Unit,
@@ -846,7 +871,7 @@ private fun SelfUpdateCard(
         if (state.config.repoSlug.isNotBlank()) {
           "Source: ${state.config.repoSlug} (${state.config.branch}) • $certText"
         } else {
-          "Link the GitHub repo where this APK is built so APK Builder can update itself."
+          "Link the GitHub repo where this APK is built so APK Builder can update itself inside this app."
         }
       Text(
         text = repoText,
@@ -917,6 +942,68 @@ private fun SelfUpdateCard(
         }
       }
 
+      Row(
+        modifier =
+          Modifier.fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onToggleInlineToken)
+            .padding(horizontal = 6.dp)
+            .testTag("self_inline_token_toggle"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+      ) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+          Icon(
+            imageVector = Icons.Filled.Key,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(16.dp),
+          )
+          Spacer(modifier = Modifier.width(8.dp))
+          Text(
+            text =
+              if (state.hasGitHubToken) "Auto Cloud Build Token: Saved"
+              else "GitHub Token for 1-Tap Cloud Build",
+            style = MaterialTheme.typography.labelMedium,
+            color =
+              if (state.hasGitHubToken) MaterialTheme.colorScheme.primary
+              else MaterialTheme.colorScheme.onSurfaceVariant,
+          )
+        }
+        Icon(
+          imageVector =
+            if (state.isInlineTokenExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+          contentDescription = null,
+          tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+      }
+
+      AnimatedVisibility(
+        visible = state.isInlineTokenExpanded,
+        enter = fadeIn() + expandVertically(),
+        exit = fadeOut() + shrinkVertically(),
+      ) {
+        Column(
+          modifier = Modifier.fillMaxWidth(),
+          verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+          MonoInputField(
+            value = gitHubTokenInput,
+            onValueChange = onGitHubTokenChange,
+            hint = stringResource(R.string.github_token_hint),
+            isSecret = true,
+            testTag = "self_inline_token_input",
+          )
+          Text(
+            text =
+              "Optional if this repo publishes GitHub Release APKs. With a token (repo + workflow scope), Update Now automatically builds & downloads the new APK right inside APK Builder with no separate Termux APK.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+          )
+        }
+      }
+
       Button(
         onClick = onRunSelfUpdate,
         enabled = !state.isRunningSelfUpdate,
@@ -942,41 +1029,34 @@ private fun SelfUpdateCard(
         Spacer(modifier = Modifier.width(8.dp))
         Text(
           text =
-            if (state.isRunningSelfUpdate) "Running Self-Update Pipeline…"
+            if (state.isRunningSelfUpdate) "Running In-App Self-Update…"
             else stringResource(R.string.self_update_run),
           style = MaterialTheme.typography.labelLarge,
         )
       }
 
-      state.pipelineStep?.let { step ->
-        Surface(
-          shape = RoundedCornerShape(14.dp),
-          color = MaterialTheme.colorScheme.surfaceContainerLow,
-          modifier = Modifier.fillMaxWidth(),
-        ) {
-          Text(
-            text = step,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.padding(12.dp),
-          )
-        }
-      }
-
-      state.statusMessage?.let { msg ->
+      val bannerText = state.pipelineStep ?: state.statusMessage
+      bannerText?.let { msg ->
+        val isStepOnly = state.pipelineStep != null
         Surface(
           shape = RoundedCornerShape(14.dp),
           color =
-            if (state.isErrorStatus) MaterialTheme.colorScheme.errorContainer
-            else MaterialTheme.colorScheme.primaryContainer,
+            when {
+              isStepOnly -> MaterialTheme.colorScheme.surfaceContainerLow
+              state.isErrorStatus -> MaterialTheme.colorScheme.errorContainer
+              else -> MaterialTheme.colorScheme.primaryContainer
+            },
           modifier = Modifier.fillMaxWidth(),
         ) {
           Text(
             text = msg,
             style = MaterialTheme.typography.bodySmall,
             color =
-              if (state.isErrorStatus) MaterialTheme.colorScheme.onErrorContainer
-              else MaterialTheme.colorScheme.onPrimaryContainer,
+              when {
+                isStepOnly -> MaterialTheme.colorScheme.onSurface
+                state.isErrorStatus -> MaterialTheme.colorScheme.onErrorContainer
+                else -> MaterialTheme.colorScheme.onPrimaryContainer
+              },
             modifier = Modifier.padding(12.dp),
           )
         }
@@ -986,18 +1066,18 @@ private fun SelfUpdateCard(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
       ) {
-        if (state.stagedWorkspacePath != null && state.termuxInstalled) {
-          CompactActionChip(
-            icon = Icons.Filled.Terminal,
-            label = stringResource(R.string.termux_run_build),
-            onClick = onRunInTermux,
-          )
-        }
+        CompactActionChip(
+          icon = Icons.Filled.Terminal,
+          label = "Open Built-In Shell",
+          onClick = onOpenBuiltInShell,
+          testTag = "self_open_shell_button",
+        )
         if (state.config.repoSlug.isNotBlank()) {
           CompactActionChip(
             icon = Icons.Filled.CloudQueue,
-            label = "Cloud CI Fallback",
+            label = "Cloud CI",
             onClick = onOpenCloudBuild,
+            testTag = "self_cloud_actions_button",
           )
         }
         Surface(
@@ -1025,6 +1105,97 @@ private fun SelfUpdateCard(
               style = MaterialTheme.typography.labelMedium,
               color = MaterialTheme.colorScheme.onSurface,
             )
+          }
+        }
+      }
+
+      // External Termux stays hidden behind an optional disclosure
+      Row(
+        modifier =
+          Modifier.fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onToggleExternalTermux)
+            .padding(horizontal = 6.dp)
+            .testTag("self_external_termux_toggle"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+      ) {
+        Text(
+          text = stringResource(R.string.self_external_termux_toggle),
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Icon(
+          imageVector =
+            if (state.isExternalTermuxExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+          contentDescription = null,
+          tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+      }
+
+      AnimatedVisibility(
+        visible = state.isExternalTermuxExpanded,
+        enter = fadeIn() + expandVertically(),
+        exit = fadeOut() + shrinkVertically(),
+      ) {
+        Surface(
+          shape = RoundedCornerShape(14.dp),
+          color = MaterialTheme.colorScheme.surfaceContainerLow,
+          modifier = Modifier.fillMaxWidth().testTag("self_external_termux_panel"),
+        ) {
+          Column(
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+          ) {
+            val termuxStatusText =
+              when {
+                !state.termuxInstalled -> "External Termux APK not installed (optional)"
+                !state.hasTermuxPermission -> "External Termux installed — grant RUN_COMMAND permission"
+                else -> "External Termux bridge ready"
+              }
+            Text(
+              text = termuxStatusText,
+              style = MaterialTheme.typography.bodySmall,
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            FlowRow(
+              horizontalArrangement = Arrangement.spacedBy(8.dp),
+              verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+              when {
+                !state.termuxInstalled -> {
+                  CompactActionChip(
+                    icon = Icons.Filled.CloudDownload,
+                    label = stringResource(R.string.termux_install_apk),
+                    onClick = onInstallTermux,
+                    testTag = "self_install_termux_button",
+                  )
+                }
+                !state.hasTermuxPermission -> {
+                  CompactActionChip(
+                    icon = Icons.Filled.VerifiedUser,
+                    label = stringResource(R.string.termux_grant_permission),
+                    onClick = onRequestTermuxPermission,
+                    testTag = "self_grant_termux_perm_button",
+                  )
+                }
+                else -> {
+                  CompactActionChip(
+                    icon = Icons.Filled.Terminal,
+                    label = stringResource(R.string.termux_run_build),
+                    onClick = onRunInTermux,
+                    testTag = "self_termux_run_button",
+                  )
+                }
+              }
+              CompactActionChip(
+                icon = Icons.Filled.ContentCopy,
+                label = stringResource(R.string.termux_copy_setup),
+                onClick = onCopyTermuxSetup,
+                testTag = "self_copy_termux_setup_button",
+              )
+            }
           }
         }
       }

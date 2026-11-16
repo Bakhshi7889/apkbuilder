@@ -1,12 +1,15 @@
 package com.example.data
 
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.StatFs
 import android.os.SystemClock
 import android.system.Os
+import androidx.core.content.ContextCompat
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -14,8 +17,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.withContext
-
-import android.app.ActivityManager
 
 data class ToolAvailability(
   val name: String,
@@ -38,8 +39,11 @@ data class SystemEnvironmentInfo(
   val freeStorageBytes: Long,
   val homeDir: String,
   val workspacesDir: String,
+  val nativeLibDir: String,
+  val bundledNativeBins: List<String>,
   val termuxInstalled: Boolean,
   val termuxVersion: String?,
+  val hasTermuxPermission: Boolean,
   val termuxApiInstalled: Boolean,
   val systemBinToolsCount: Int,
   val tools: List<ToolAvailability>,
@@ -64,6 +68,7 @@ class ShellEngine(private val context: Context) {
   val tmpDir: File = File(context.filesDir, "tmp").apply { mkdirs() }
   val prefixDir: File = File(context.filesDir, "usr").apply { mkdirs() }
   val workspacesDir: File = File(context.filesDir, "workspaces").apply { mkdirs() }
+  val nativeLibDirPath: String = context.applicationInfo.nativeLibraryDir.orEmpty()
 
   private val envVars: MutableMap<String, String> =
     mutableMapOf(
@@ -73,6 +78,7 @@ class ShellEngine(private val context: Context) {
       "TERM" to "xterm-256color",
       "LANG" to "en_US.UTF-8",
       "WORKSPACES" to workspacesDir.absolutePath,
+      "NATIVE_LIB_DIR" to nativeLibDirPath,
     )
 
   @Volatile var currentWorkingDir: File = homeDir
@@ -84,7 +90,22 @@ class ShellEngine(private val context: Context) {
     val binDir = File(prefixDir, "bin").apply { mkdirs() }
     val systemPath = System.getenv("PATH") ?: "/system/bin:/system/xbin:/vendor/bin"
     val termuxBin = "/data/data/com.termux/files/usr/bin"
-    envVars["PATH"] = "${binDir.absolutePath}:$systemPath:$termuxBin"
+    val pathSegments =
+      listOfNotNull(
+        nativeLibDirPath.takeIf { it.isNotBlank() },
+        binDir.absolutePath,
+        systemPath,
+        termuxBin,
+      )
+    envVars["PATH"] = pathSegments.joinToString(":")
+    val existingLd = System.getenv("LD_LIBRARY_PATH").orEmpty()
+    val ldSegments =
+      listOfNotNull(
+        nativeLibDirPath.takeIf { it.isNotBlank() },
+        File(prefixDir, "lib").apply { mkdirs() }.absolutePath,
+        existingLd.takeIf { it.isNotBlank() },
+      )
+    envVars["LD_LIBRARY_PATH"] = ldSegments.joinToString(":")
     val memInfo = readMemoryInfo()
     val heapMb = computeRecommendedHeapMb(memInfo.totalMem)
     envVars["GRADLE_OPTS"] = "-Xmx${heapMb}m -XX:+UseParallelGC"
@@ -125,6 +146,17 @@ class ShellEngine(private val context: Context) {
     }
   }
 
+  fun hasTermuxRunPermission(): Boolean {
+    return ContextCompat.checkSelfPermission(context, TERMUX_RUN_PERMISSION) ==
+      PackageManager.PERMISSION_GRANTED
+  }
+
+  fun createInstallTermuxIntent(): Intent {
+    return Intent(Intent.ACTION_VIEW, Uri.parse(TERMUX_RELEASES_URL)).apply {
+      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+  }
+
   suspend fun inspectEnvironment(): SystemEnvironmentInfo =
     withContext(Dispatchers.IO) {
       val uname = runCatching { Os.uname() }.getOrNull()
@@ -134,7 +166,8 @@ class ShellEngine(private val context: Context) {
       val cpuCores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
       val heapMb = computeRecommendedHeapMb(memInfo.totalMem)
 
-      val termuxInfo = getPackageVersion("com.termux")
+      val termuxInfo = getPackageVersion(TERMUX_PACKAGE)
+      val termuxPerm = termuxInfo != null && hasTermuxRunPermission()
       val termuxApiInfo = getPackageVersion("com.termux.api")
 
       val probedTools =
@@ -146,6 +179,7 @@ class ShellEngine(private val context: Context) {
             )
           }
 
+      val bundledBins = listBundledNativeTools()
       val systemBinCount =
         File("/system/bin").listFiles()?.count { it.isFile } ?: 0
 
@@ -162,16 +196,32 @@ class ShellEngine(private val context: Context) {
         freeStorageBytes = freeBytes,
         homeDir = homeDir.absolutePath,
         workspacesDir = workspacesDir.absolutePath,
+        nativeLibDir = nativeLibDirPath,
+        bundledNativeBins = bundledBins,
         termuxInstalled = termuxInfo != null,
         termuxVersion = termuxInfo,
+        hasTermuxPermission = termuxPerm,
         termuxApiInstalled = termuxApiInfo != null,
         systemBinToolsCount = systemBinCount,
         tools = probedTools,
       )
     }
 
+  fun listBundledNativeTools(): List<String> {
+    if (nativeLibDirPath.isBlank()) return emptyList()
+    val dir = File(nativeLibDirPath)
+    if (!dir.exists() || !dir.isDirectory) return emptyList()
+    return dir.listFiles()
+      ?.filter { it.isFile && (it.canExecute() || it.name.endsWith(".so")) }
+      ?.map { it.name }
+      ?.sorted()
+      ?: emptyList()
+  }
+
+  fun currentEnvSnapshot(): Map<String, String> = envVars.toMap()
+
   fun createLaunchTermuxIntent(): Intent? {
-    return context.packageManager.getLaunchIntentForPackage("com.termux")
+    return context.packageManager.getLaunchIntentForPackage(TERMUX_PACKAGE)
   }
 
   suspend fun listDirectory(dir: File = currentWorkingDir): List<FsEntry> =
@@ -265,6 +315,13 @@ class ShellEngine(private val context: Context) {
     }
 
     if (trimmed == "tools") {
+      val bundled = listBundledNativeTools()
+      if (bundled.isEmpty()) {
+        send(ShellEvent.Line("NATIVE_LIB_DIR ($nativeLibDirPath): no extra bundled lib*.so CLIs"))
+      } else {
+        send(ShellEvent.Line("NATIVE_LIB_DIR (${bundled.size} bundled executables):"))
+        bundled.chunked(4).forEach { row -> send(ShellEvent.Line("  " + row.joinToString("  "))) }
+      }
       val bins =
         File("/system/bin")
           .listFiles()
@@ -331,6 +388,12 @@ class ShellEngine(private val context: Context) {
   }
 
   private fun resolveBinary(tool: String): String? {
+    if (nativeLibDirPath.isNotBlank()) {
+      val libCandidate = File(nativeLibDirPath, "lib${tool}.so")
+      if (libCandidate.exists() && libCandidate.isFile && libCandidate.canExecute()) {
+        return libCandidate.absolutePath
+      }
+    }
     val searchPaths = (envVars["PATH"] ?: "/system/bin:/system/xbin").split(":")
     for (dir in searchPaths) {
       if (dir.isBlank()) continue
@@ -361,5 +424,11 @@ class ShellEngine(private val context: Context) {
         }
       info.versionName ?: "installed"
     }.getOrNull()
+  }
+
+  companion object {
+    const val TERMUX_PACKAGE = "com.termux"
+    const val TERMUX_RUN_PERMISSION = "com.termux.permission.RUN_COMMAND"
+    const val TERMUX_RELEASES_URL = "https://github.com/termux/termux-app/releases"
   }
 }

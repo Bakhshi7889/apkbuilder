@@ -33,9 +33,11 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.NotificationsActive
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.Notifications
+import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.VerifiedUser
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
@@ -65,11 +67,15 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import com.example.data.ShellEngine
 import com.example.ui.AppTab
 import com.example.ui.AppsScreen
+import com.example.ui.BuildMode
 import com.example.ui.BuilderScreen
 import com.example.ui.MainViewModel
 import com.example.ui.SelfUpdateUiState
+import com.example.ui.ShellScreen
+import com.example.ui.ShellUiState
 import com.example.ui.SignScreen
 import com.example.ui.theme.TermForgeTheme
 import java.io.File
@@ -92,9 +98,12 @@ fun TermForgeApp(viewModel: MainViewModel = viewModel()) {
   val appsState by viewModel.appsState.collectAsStateWithLifecycle()
   val selfUpdateState by viewModel.selfUpdateState.collectAsStateWithLifecycle()
   val builderState by viewModel.builderState.collectAsStateWithLifecycle()
+  val shellState by viewModel.shellState.collectAsStateWithLifecycle()
   val signState by viewModel.signState.collectAsStateWithLifecycle()
   val lifecycleOwner = LocalLifecycleOwner.current
+  val context = LocalContext.current
   var pendingExportApkPath by remember { mutableStateOf<String?>(null) }
+  var pendingTermuxAfterPermission by remember { mutableStateOf<(() -> Unit)?>(null) }
 
   DisposableEffect(lifecycleOwner, viewModel) {
     val observer = LifecycleEventObserver { _, event ->
@@ -163,6 +172,16 @@ fun TermForgeApp(viewModel: MainViewModel = viewModel()) {
       viewModel.refreshNotificationPermissionStatus()
     }
 
+  val termuxPermissionLauncher =
+    rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+      viewModel.onTermuxPermissionResult(granted)
+      val pending = pendingTermuxAfterPermission
+      pendingTermuxAfterPermission = null
+      if (granted) {
+        pending?.invoke()
+      }
+    }
+
   val exportSelfApkLauncher =
     rememberLauncherForActivityResult(
       ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")
@@ -190,12 +209,58 @@ fun TermForgeApp(viewModel: MainViewModel = viewModel()) {
     }
   }
 
+  val requestTermuxPermission: () -> Unit = {
+    val env = builderState.envInfo
+    if (env?.termuxInstalled == true) {
+      termuxPermissionLauncher.launch(ShellEngine.TERMUX_RUN_PERMISSION)
+    } else {
+      runCatching { context.startActivity(viewModel.createInstallTermuxIntent()) }
+    }
+  }
+
+  val runSelfInTermuxWithPermCheck = {
+    val dispatch = {
+      dispatchTermuxRunIntent(
+        context = context,
+        runIntent = viewModel.prepareSelfTermuxRunIntent(),
+        fallbackLaunch = viewModel.createTermuxLaunchIntent(),
+        onResult = viewModel::onTermuxDispatchResult,
+      )
+    }
+    if (builderState.envInfo?.hasTermuxPermission == true) {
+      dispatch()
+    } else {
+      pendingTermuxAfterPermission = dispatch
+      termuxPermissionLauncher.launch(ShellEngine.TERMUX_RUN_PERMISSION)
+    }
+  }
+
+  val runWorkspaceInTermuxWithPermCheck = {
+    val dispatch = {
+      viewModel.launchActiveWorkspaceInTermux { intent ->
+        dispatchTermuxRunIntent(
+          context = context,
+          runIntent = intent,
+          fallbackLaunch = viewModel.createTermuxLaunchIntent(),
+          onResult = viewModel::onTermuxDispatchResult,
+        )
+      }
+    }
+    if (builderState.envInfo?.hasTermuxPermission == true) {
+      dispatch()
+    } else {
+      pendingTermuxAfterPermission = dispatch
+      termuxPermissionLauncher.launch(ShellEngine.TERMUX_RUN_PERMISSION)
+    }
+  }
+
   BackHandler(
     enabled =
       activeTab != AppTab.BUILD ||
         appsState.isAddFormExpanded ||
         selfUpdateState.isConfigExpanded ||
         selfUpdateState.isCiYamlExpanded ||
+        shellState.isDiagnosticsExpanded ||
         builderState.expandedFilePath != null ||
         builderState.isGitHubFormExpanded
   ) {
@@ -203,6 +268,7 @@ fun TermForgeApp(viewModel: MainViewModel = viewModel()) {
       activeTab == AppTab.APPS && selfUpdateState.isCiYamlExpanded -> viewModel.toggleSelfCiYaml()
       activeTab == AppTab.APPS && selfUpdateState.isConfigExpanded -> viewModel.toggleSelfUpdateConfig()
       activeTab == AppTab.APPS && appsState.isAddFormExpanded -> viewModel.toggleAddWatchedAppForm()
+      activeTab == AppTab.SHELL && shellState.isDiagnosticsExpanded -> viewModel.toggleShellDiagnostics()
       activeTab != AppTab.BUILD -> viewModel.selectTab(AppTab.BUILD)
       builderState.expandedFilePath != null ->
         viewModel.openOrCloseFile(builderState.expandedFilePath!!)
@@ -272,6 +338,26 @@ fun TermForgeApp(viewModel: MainViewModel = viewModel()) {
               modifier = Modifier.testTag("nav_build"),
             )
             NavigationRailItem(
+              selected = activeTab == AppTab.SHELL,
+              onClick = { viewModel.selectTab(AppTab.SHELL) },
+              icon = {
+                Icon(
+                  imageVector =
+                    if (activeTab == AppTab.SHELL) Icons.Filled.Terminal
+                    else Icons.Outlined.Terminal,
+                  contentDescription = stringResource(R.string.cd_nav_shell),
+                )
+              },
+              label = { Text(stringResource(R.string.nav_shell)) },
+              colors =
+                NavigationRailItemDefaults.colors(
+                  selectedIconColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                  selectedTextColor = MaterialTheme.colorScheme.primary,
+                  indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+                ),
+              modifier = Modifier.testTag("nav_shell"),
+            )
+            NavigationRailItem(
               selected = activeTab == AppTab.SIGN,
               onClick = { viewModel.selectTab(AppTab.SIGN) },
               icon = {
@@ -299,10 +385,14 @@ fun TermForgeApp(viewModel: MainViewModel = viewModel()) {
               appsState = appsState,
               selfUpdateState = selfUpdateState,
               builderState = builderState,
+              shellState = shellState,
               signState = signState,
               viewModel = viewModel,
               onCheckGitHubUpdates = triggerUpdateCheckWithPermission,
               onRequestNotifications = requestNotificationsOnly,
+              onRequestTermuxPermission = requestTermuxPermission,
+              onRunSelfInTermux = runSelfInTermuxWithPermCheck,
+              onRunWorkspaceInTermux = runWorkspaceInTermuxWithPermCheck,
               onLaunchZipPicker = {
                 zipPickerLauncher.launch(
                   arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")
@@ -386,6 +476,32 @@ fun TermForgeApp(viewModel: MainViewModel = viewModel()) {
               modifier = Modifier.testTag("nav_build"),
             )
             NavigationBarItem(
+              selected = activeTab == AppTab.SHELL,
+              onClick = { viewModel.selectTab(AppTab.SHELL) },
+              icon = {
+                Icon(
+                  imageVector =
+                    if (activeTab == AppTab.SHELL) Icons.Filled.Terminal
+                    else Icons.Outlined.Terminal,
+                  contentDescription = stringResource(R.string.cd_nav_shell),
+                )
+              },
+              label = {
+                Text(
+                  text = stringResource(R.string.nav_shell),
+                  style = MaterialTheme.typography.labelMedium,
+                  maxLines = 1,
+                )
+              },
+              colors =
+                NavigationBarItemDefaults.colors(
+                  selectedIconColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                  selectedTextColor = MaterialTheme.colorScheme.primary,
+                  indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+                ),
+              modifier = Modifier.testTag("nav_shell"),
+            )
+            NavigationBarItem(
               selected = activeTab == AppTab.SIGN,
               onClick = { viewModel.selectTab(AppTab.SIGN) },
               icon = {
@@ -400,6 +516,7 @@ fun TermForgeApp(viewModel: MainViewModel = viewModel()) {
                 Text(
                   text = stringResource(R.string.nav_sign),
                   style = MaterialTheme.typography.labelMedium,
+                  maxLines = 1,
                 )
               },
               colors =
@@ -425,10 +542,14 @@ fun TermForgeApp(viewModel: MainViewModel = viewModel()) {
             appsState = appsState,
             selfUpdateState = selfUpdateState,
             builderState = builderState,
+            shellState = shellState,
             signState = signState,
             viewModel = viewModel,
             onCheckGitHubUpdates = triggerUpdateCheckWithPermission,
             onRequestNotifications = requestNotificationsOnly,
+            onRequestTermuxPermission = requestTermuxPermission,
+            onRunSelfInTermux = runSelfInTermuxWithPermCheck,
+            onRunWorkspaceInTermux = runWorkspaceInTermuxWithPermCheck,
             onLaunchZipPicker = {
               zipPickerLauncher.launch(
                 arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")
@@ -492,10 +613,14 @@ private fun TabContent(
   appsState: com.example.ui.AppsUiState,
   selfUpdateState: SelfUpdateUiState,
   builderState: com.example.ui.BuilderUiState,
+  shellState: ShellUiState,
   signState: com.example.ui.SignUiState,
   viewModel: MainViewModel,
   onCheckGitHubUpdates: () -> Unit,
   onRequestNotifications: () -> Unit,
+  onRequestTermuxPermission: () -> Unit,
+  onRunSelfInTermux: () -> Unit,
+  onRunWorkspaceInTermux: () -> Unit,
   onLaunchZipPicker: () -> Unit,
   onLaunchFolderPicker: () -> Unit,
   onLaunchExportZip: (String) -> Unit,
@@ -515,6 +640,9 @@ private fun TabContent(
         AppsScreen(
           state = appsState,
           selfUpdateState = selfUpdateState,
+          gitHubTokenInput = builderState.gitHubTokenInput,
+          onGitHubTokenChange = viewModel::updateGitHubTokenInput,
+          onToggleSelfInlineToken = viewModel::toggleSelfInlineToken,
           onToggleSelfConfig = viewModel::toggleSelfUpdateConfig,
           onSelfRepoInputChange = viewModel::updateSelfRepoInput,
           onSaveSelfRepo = viewModel::saveSelfUpdateRepo,
@@ -522,13 +650,14 @@ private fun TabContent(
           onCopySelfCiYaml = { _ -> viewModel.copyStarterCiWorkflow() },
           starterCiYaml = viewModel.getStarterCiWorkflowYaml(),
           onRunSelfUpdate = viewModel::runSelfUpdateResilient,
-          onRunSelfInTermux = {
-            dispatchTermuxRunIntent(
-              context = context,
-              runIntent = viewModel.prepareSelfTermuxRunIntent(),
-              fallbackLaunch = viewModel.createTermuxLaunchIntent(),
-            )
+          onOpenBuiltInShell = { viewModel.openBuiltInShell("probe") },
+          onToggleSelfExternalTermux = viewModel::toggleSelfExternalTermux,
+          onRunSelfInTermux = onRunSelfInTermux,
+          onInstallTermux = {
+            runCatching { context.startActivity(viewModel.createInstallTermuxIntent()) }
           },
+          onRequestTermuxPermission = onRequestTermuxPermission,
+          onCopySelfTermuxSetup = { viewModel.copyTermuxSetupCommand(forSelfUpdate = true) },
           onOpenSelfCloudBuild = viewModel::openSelfRepoInBuilderCloud,
           onExportSelfApk = onLaunchExportSelfApk,
           onShareSelfApk = { path ->
@@ -597,14 +726,32 @@ private fun TabContent(
           onSendApkToSigner = viewModel::sendBuiltApkToSigner,
           onExportZip = onLaunchExportZip,
           onCopyScript = viewModel::copyGeneratedScriptToClipboard,
-          onRunInTermux = {
-            dispatchTermuxRunIntent(
-              context = context,
-              runIntent = viewModel.prepareActiveWorkspaceTermuxIntent(),
-              fallbackLaunch = viewModel.createTermuxLaunchIntent(),
-            )
+          onOpenBuiltInShell = { viewModel.openBuiltInShell() },
+          onToggleExternalTermux = viewModel::toggleBuilderExternalTermux,
+          onRunInTermux = onRunWorkspaceInTermux,
+          onInstallTermux = {
+            runCatching { context.startActivity(viewModel.createInstallTermuxIntent()) }
           },
+          onRequestTermuxPermission = onRequestTermuxPermission,
+          onCopyTermuxSetup = { viewModel.copyTermuxSetupCommand(forSelfUpdate = false) },
           onCreateTermuxIntent = viewModel::createTermuxLaunchIntent,
+        )
+      }
+      AppTab.SHELL -> {
+        ShellScreen(
+          state = shellState,
+          onCommandInputChange = viewModel::updateShellCommandInput,
+          onRunCommand = viewModel::runShellCommand,
+          onStopCommand = viewModel::stopShellCommand,
+          onToggleDiagnostics = viewModel::toggleShellDiagnostics,
+          onRefreshProbe = { viewModel.runShellCommand("probe") },
+          onRecallPreviousCommand = viewModel::recallPreviousShellCommand,
+          onOpenCloudBuild = {
+            if (builderState.activeGitHubMeta != null) {
+              viewModel.setBuildMode(BuildMode.CLOUD_GITHUB_ACTIONS)
+            }
+            viewModel.selectTab(AppTab.BUILD)
+          },
         )
       }
       AppTab.SIGN -> {
@@ -632,23 +779,34 @@ private fun dispatchTermuxRunIntent(
   context: Context,
   runIntent: Intent?,
   fallbackLaunch: Intent?,
+  onResult: (dispatched: Boolean, errorDetail: String?) -> Unit,
 ) {
+  var errorDetail: String? = null
   val dispatched =
     if (runIntent != null) {
-      runCatching {
-        context.startService(runIntent)
-        true
-      }.getOrElse {
+      val direct =
         runCatching {
-          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(runIntent)
-            true
-          } else {
-            false
-          }
-        }.getOrDefault(false)
+          context.startService(runIntent)
+          true
+        }.getOrElse { err ->
+          errorDetail = err.message ?: err::class.java.simpleName
+          false
+        }
+      if (direct) {
+        true
+      } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        runCatching {
+          context.startForegroundService(runIntent)
+          true
+        }.getOrElse { err ->
+          errorDetail = err.message ?: err::class.java.simpleName
+          false
+        }
+      } else {
+        false
       }
     } else {
+      errorDetail = "No build target configured"
       false
     }
   if (!dispatched) {
@@ -656,6 +814,7 @@ private fun dispatchTermuxRunIntent(
       runCatching { context.startActivity(launch) }
     }
   }
+  onResult(dispatched, errorDetail)
 }
 
 private fun shareApkIntent(context: Context, shareIntent: Intent?) {
